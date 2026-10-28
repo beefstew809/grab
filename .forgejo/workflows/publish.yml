@@ -68,10 +68,12 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
+          # HEAD = everything reachable from the commit being published, not
+          # every fetched branch: a dirty side branch must not block main.
           if [ "$REF_TYPE" = tag ]; then
-            sh scripts/public-guard.sh --all "$REF_NAME"
+            sh scripts/public-guard.sh HEAD "$REF_NAME"
           else
-            sh scripts/public-guard.sh --all
+            sh scripts/public-guard.sh HEAD
           fi
 
       # The separate secret-scan workflow only gates merges; direct pushes to
@@ -89,7 +91,7 @@ jobs:
           curl -sSL -o "$work/$sums" "$base/$sums"
           ( cd "$work" && grep " ${tarball}\$" "$sums" | sha256sum -c - )
           tar -xzf "$work/$tarball" -C "$work" gitleaks
-          "$work/gitleaks" git --log-opts="--all" --redact --no-banner .
+          "$work/gitleaks" git --log-opts="HEAD" --redact --no-banner .
           rm -rf "$work"
 
   image:

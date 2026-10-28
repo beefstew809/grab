@@ -58,9 +58,9 @@ jobs:
           if [ "$EVENT" = pull_request ]; then
             sh scripts/public-guard.sh "$BASE_SHA..$HEAD_SHA"
           elif [ "$REF_TYPE" = tag ]; then
-            sh scripts/public-guard.sh --all "$REF_NAME"
+            sh scripts/public-guard.sh HEAD "$REF_NAME"
           else
-            sh scripts/public-guard.sh --all
+            sh scripts/public-guard.sh HEAD
           fi
 
       - name: Guard self-test
