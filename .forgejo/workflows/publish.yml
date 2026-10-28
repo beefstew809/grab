@@ -141,6 +141,12 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
           provenance: mode=min,builder-id=https://github.com/beefstew809/grab
+          # GitHub links a ghcr package to its repo from the top-level index's
+          # annotations, not the image config's labels.
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/beefstew809/grab
+            index:org.opencontainers.image.licenses=AGPL-3.0-only
+            index:org.opencontainers.image.description=Share a link from your phone, get a file that plays in the chat.
           sbom: true
         env:
           BUILDX_GIT_INFO: "false"
