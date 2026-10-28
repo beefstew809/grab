@@ -4,3 +4,7 @@ __pycache__/
 e2e/*.png
 docs/superpowers/
 .superpowers/
+# Local AI-assistant config and notes never ship.
+.claude/
+CLAUDE.md
+AGENTS.md
