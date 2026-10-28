@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -31,7 +33,9 @@ type Conversions interface {
 
 // App is the HTTP surface: the static PWA, the share API, /auth/* and /healthz.
 type App struct {
-	Static    fs.FS
+	Static fs.FS
+	// Version is added to the page's app.js/app.css links (see staticFiles).
+	Version   string
 	Store     *Store
 	SharesDir string
 	Prober    MediaProber
@@ -146,7 +150,7 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", a.healthz)
 	// "/" rather than "GET /": ServeMux rejects "GET /" next to "/api/" as
 	// conflicting patterns, so the method check lives in getOnly.
-	mux.Handle("/", getOnly(noCache(http.FileServerFS(a.Static))))
+	mux.Handle("/", getOnly(noCache(a.staticFiles())))
 	if a.Auth != nil {
 		a.Auth.Register(mux)
 	}
@@ -161,6 +165,33 @@ func requireUser(auth Auth, h http.Handler) http.Handler {
 		})
 	}
 	return auth.Wrap(h)
+}
+
+// staticFiles serves the PWA. The page itself gets versioned links to its
+// script and stylesheet: grab sends no-cache for everything, but a proxy in
+// front (Cloudflare's browser-cache TTL) can hand phones a stale app.js for an
+// hour after a release, while the page always arrives fresh.
+func (a *App) staticFiles() http.Handler {
+	files := http.FileServerFS(a.Static)
+	v := url.QueryEscape(cmp.Or(a.Version, "dev"))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+			files.ServeHTTP(w, r)
+			return
+		}
+		page, err := fs.ReadFile(a.Static, "index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		html := strings.NewReplacer(`src="/app.js"`, `src="/app.js?v=`+v+`"`,
+			`href="/app.css"`, `href="/app.css?v=`+v+`"`).Replace(string(page))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if r.Method == http.MethodHead {
+			return
+		}
+		io.WriteString(w, html)
+	})
 }
 
 func getOnly(h http.Handler) http.Handler {

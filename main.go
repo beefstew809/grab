@@ -86,7 +86,7 @@ func main() {
 		lib.Jellyfin = &Jellyfin{URL: cfg.Jellyfin.URL, APIKey: cfg.Jellyfin.APIKey, LibraryID: cfg.Jellyfin.LibraryID, HC: hc}
 	}
 	static, _ := fs.Sub(webFS, "web")
-	app := &App{Static: static, Store: st, SharesDir: sharesDir, Prober: prober, Conv: conv, Library: lib, Auth: auth, Cookies: cookies, Notifier: notifier,
+	app := &App{Static: static, Version: version, Store: st, SharesDir: sharesDir, Prober: prober, Conv: conv, Library: lib, Auth: auth, Cookies: cookies, Notifier: notifier,
 		Nudge: tracker.Nudge, HC: hc,
 		Health: func() map[string]error {
 			checks := map[string]error{}
