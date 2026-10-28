@@ -1,0 +1,67 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Share diagnostics</title>
+<link rel="stylesheet" href="/app.css">
+<!-- Isolates why navigator.share() refuses a file on a given phone/browser.
+     Open /diag.html?item=<id>&preset=discord, tap Load, then each test. -->
+<div class="card">
+  <h1>Share diagnostics</h1>
+  <p class="meta" id="env"></p>
+  <button id="load">Load file</button>
+  <div id="tests"></div>
+  <pre id="log" style="white-space:pre-wrap;font-size:.85rem"></pre>
+</div>
+<script>
+const q = new URLSearchParams(location.search);
+const item = q.get('item'), preset = q.get('preset') || 'discord';
+const log = (s) => { document.getElementById('log').textContent += s + '\n'; };
+document.getElementById('env').textContent =
+  `item=${item} preset=${preset} · share=${'share' in navigator} canShare=${'canShare' in navigator} · ${navigator.userAgent}`;
+let chunked = null, blobbed = null, title = 'video';
+
+document.getElementById('load').onclick = async () => {
+  try {
+    const d = await (await fetch('/api/items/' + item)).json();
+    title = d.title || 'video';
+    const url = `/api/items/${item}/file?preset=${preset}`;
+    const r1 = await fetch(url);
+    const reader = r1.body.getReader(); const parts = [];
+    for (;;) { const { done, value } = await reader.read(); if (done) break; parts.push(value); }
+    chunked = parts;
+    blobbed = await (await fetch(url)).blob();
+    log(`loaded: chunked ${parts.reduce((n, p) => n + p.length, 0)} B, blob ${blobbed.size} B type "${blobbed.type}", title "${title}"`);
+    render();
+  } catch (e) { log('load failed: ' + e.name + ': ' + e.message); }
+};
+
+function variants() {
+  const titled = title.replace(/[\\/:*?"|\u0000-\u001f]+/g, ' ').trim().slice(0, 80) + '.mp4';
+  return [
+    ['1 text only', () => ({ text: 'share test' })],
+    ['2 file, name video.mp4', () => ({ files: [new File(chunked, 'video.mp4', { type: 'video/mp4' })] })],
+    ['3 file, title name (as the app)', () => ({ files: [new File(chunked, titled, { type: 'video/mp4' })] })],
+    ['4 blob(), name video.mp4', () => ({ files: [new File([blobbed], 'video.mp4', { type: 'video/mp4' })] })],
+  ];
+}
+
+function render() {
+  const box = document.getElementById('tests');
+  box.replaceChildren();
+  for (const [label, make] of variants()) {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.style.marginTop = '8px';
+    // share() is called synchronously in the tap handler: user activation is fresh.
+    b.onclick = () => {
+      const data = make();
+      let can = 'n/a';
+      try { can = navigator.canShare ? navigator.canShare(data) : 'no canShare'; } catch (e) { can = 'threw ' + e.name; }
+      navigator.share(data).then(
+        () => log(`${label}: OK (canShare ${can})`),
+        (e) => log(`${label}: ${e.name}: ${e.message} (canShare ${can})`));
+    };
+    box.append(b);
+  }
+}
+</script>

@@ -1,0 +1,45 @@
+# grab + MeTube. Copy to compose.yml, copy .env.example to .env, edit, then
+# `docker compose up -d`. Put a TLS reverse proxy in front of grab's port 8080.
+#
+# MeTube has NO published port on purpose: its web UI shows everyone's
+# downloads and allows yt-dlp option overrides that can run commands.
+
+services:
+  grab:
+    image: ghcr.io/OWNER/grab:latest # replace OWNER and pin a version tag
+    restart: unless-stopped
+    user: "1000:1000" # must match MeTube
+    env_file: .env
+    ports:
+      - "8080:8080" # point your reverse proxy here
+    volumes:
+      - ./shares:/shares
+      - ./data:/data
+      - ./cookies:/cookies
+    # For ENCODER=vaapi, also pass the GPU through:
+    # devices:
+    #   - /dev/dri:/dev/dri
+    networks: [internal]
+    depends_on: [metube]
+
+  metube:
+    image: ghcr.io/alexta69/metube:latest@sha256:78560456793445f4449d8b9d92374350c652725aa76dc75f8682d43fc5ff9a5b # pin a version in real use
+    restart: unless-stopped
+    user: "1000:1000" # must match grab
+    # No `ports:` -- only grab reaches it, over the internal network.
+    environment:
+      CUSTOM_DIRS: "true"
+      ALLOW_YTDL_OPTIONS_OVERRIDES: "true"
+      # The id keeps two videos with the same title (Instagram's are all
+      # "Video by <account>") from landing on one file.
+      OUTPUT_TEMPLATE: "%(title).100s [%(id).40s].%(ext)s"
+      DOWNLOAD_DIR: /shares
+      STATE_DIR: /metube-state
+    volumes:
+      - ./shares:/shares
+      - ./cookies:/cookies # same path as in grab; read-write: yt-dlp may refresh cookies
+      - ./metube-state:/metube-state
+    networks: [internal]
+
+networks:
+  internal:

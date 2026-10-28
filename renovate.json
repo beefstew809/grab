@@ -1,0 +1,17 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "local>homelab/renovate-config"
+  ],
+  "gitAuthor": "Renovate Bot <bot@renovateapp.com>",
+  "automergeStrategy": "fast-forward",
+  "packageRules": [
+    {
+      "description": "upload-artifact must stay below v4. v4+ bundles @actions/artifact v2, which refuses any non-github.com server outright (GHESNotSupportedError) -- Forgejo implements the v3 artifact API and only that one. A bump across this boundary fails every push-to-main build at the scan-report upload, and it fails invisibly on pull requests because that step is skipped there. Patch updates within v3 are still welcome.",
+      "matchDepNames": [
+        "/upload-artifact/"
+      ],
+      "allowedVersions": "<4"
+    }
+  ]
+}
