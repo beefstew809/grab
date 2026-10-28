@@ -48,9 +48,10 @@ func TestNoPersonalStrings(t *testing.T) {
 		}
 		scanned++
 		low := strings.ToLower(string(b))
-		for _, s := range deny {
+		for i, s := range deny {
 			if strings.Contains(low, s) {
-				t.Errorf("%s contains a denied string (entry %q)", path, s)
+				// The entry's position, not its text: CI logs must not repeat it.
+				t.Errorf("%s contains denied entry #%d", path, i+1)
 			}
 		}
 		return nil

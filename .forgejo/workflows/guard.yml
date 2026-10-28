@@ -1,0 +1,66 @@
+name: guard
+
+# Keeps personal strings out of everything that gets published: the file tree
+# (TestNoPersonalStrings) and commit/tag metadata (scripts/public-guard.sh).
+# The deny-list lives only in the GRAB_DENYLIST secret; without it this job
+# fails rather than passing vacuously.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  guard:
+    runs-on: docker
+    env:
+      GRAB_DENYLIST: ${{ secrets.GRAB_DENYLIST }}
+    steps:
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Require the deny-list
+        run: |
+          if [ -z "$GRAB_DENYLIST" ]; then
+            echo "GRAB_DENYLIST is not set; refusing to pass" >&2
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: https://data.forgejo.org/actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: File tree
+        run: |
+          go test -count=1 -run '^TestNoPersonalStrings$' -v . > tree.log 2>&1 || { cat tree.log; exit 1; }
+          cat tree.log
+          # A skip would mean the list never reached the test.
+          if grep -e '--- SKIP' tree.log > /dev/null; then
+            echo "tree check skipped" >&2
+            exit 1
+          fi
+
+      - name: Commit and tag metadata
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # The PR's own head, not HEAD: a PR checkout can be a synthetic merge.
+          if [ "$EVENT" = pull_request ]; then
+            sh scripts/public-guard.sh "$BASE_SHA..$HEAD_SHA"
+          elif [ "$REF_TYPE" = tag ]; then
+            sh scripts/public-guard.sh --all "$REF_NAME"
+          else
+            sh scripts/public-guard.sh --all
+          fi
+
+      - name: Guard self-test
+        run: sh scripts/public-guard_test.sh

@@ -1,0 +1,40 @@
+name: test
+
+# go vet + go test on every PR and push to main, with real ffmpeg like the
+# Dockerfile build stage: libx264 because CI runners have no GPU, and
+# SHARE_REQUIRE_FFMPEG=1 so the conversion tests fail rather than skip.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  go-test:
+    runs-on: docker
+    env:
+      SHARE_TEST_ENCODER: libx264
+      SHARE_REQUIRE_FFMPEG: "1"
+    steps:
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install ffmpeg
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ffmpeg
+          # Not grep -q: it exits at the first match, ffmpeg then dies of
+          # SIGPIPE (exit 141) and pipefail fails the step.
+          ffmpeg -hide_banner -encoders | grep libx264 > /dev/null
+
+      - name: Set up Go
+        uses: https://data.forgejo.org/actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...

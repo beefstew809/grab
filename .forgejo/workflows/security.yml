@@ -1,0 +1,17 @@
+name: security
+
+# Dependency, filesystem and secret scans, shared with the other homelab apps
+# through a reusable workflow (its README documents the exception formats).
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  scan:
+    uses: homelab/ci-workflows/.forgejo/workflows/app-security.yml@main
+    with:
+      go_dirs: .
