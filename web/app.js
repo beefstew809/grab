@@ -71,16 +71,45 @@ function sharedLink(p) {
 }
 
 async function send(url, target) {
-  status.textContent = 'Sending…';
+  const g = ++gen;
+  status.textContent = '';
+  // Say what is happening straight away, before the server answers.
+  renderProgress({ url, target, source: '' }, 'Sending…', null);
   try {
     const r = await api('/downloads', jsonOpts('POST', { url, target }));
-    status.textContent = r.existing ? 'Already downloaded' : '✓ Queued';
+    if (g !== gen) return;
+    if (r.existing) status.textContent = 'Already downloaded';
     // replaceState: a refresh must not re-submit the shared link.
     history.replaceState(null, '', '/?item=' + r.id);
-    watch(r.id, Date.now(), ++gen);
+    watch(r.id, Date.now(), g, !r.existing);
   } catch (e) {
-    status.textContent = '✗ ' + e.message;
+    if (g === gen) renderNote('✗ ' + e.message, true);
   }
+}
+
+// The screen shown after a share until the file is ready: what was shared,
+// which stage it is in, and whether it is fine to close the app.
+function renderProgress(it, stage, pct) {
+  const short = (it.url || '').replace(/^https?:\/\//, '');
+  const where = [it.source, short.length > 40 ? short.slice(0, 40) + '…' : short].filter(Boolean).join(' · ');
+  const kids = [el('h2', { textContent: '⬇ Got it — downloading' }),
+    el('p', { className: 'meta', textContent: where })];
+  const bar = el('progress', { className: 'stage', max: 100 });
+  if (pct != null) bar.value = pct; // no value = indeterminate
+  kids.push(bar, el('p', { className: 'stage-text', textContent: stage }));
+  const label = targetLabel(it.target);
+  if (label && !stage.startsWith('Fitting')) kids.push(el('p', { className: 'meta', textContent: 'Then: fit for ' + label }));
+  kids.push(el('p', { className: 'meta hint', textContent: me && me.notify && me.notify.set
+    ? 'You can close this — you’ll get a notification when it’s ready.'
+    : 'You can close this — it’ll be in your Recent list.' }));
+  main.replaceChildren(el('div', { className: 'progress-card' }, ...kids));
+}
+
+// Label of a conversion target, or '' for "Download only".
+function targetLabel(name) {
+  if (!name || name === 'original') return '';
+  const t = ((me && me.targets) || []).find(x => x.name === name);
+  return t ? t.label : name;
 }
 
 function renderTargets() {
@@ -97,10 +126,12 @@ function renderTargets() {
   }
 }
 
-async function watch(id, started, g) {
+// fromShare: opened by a share or the paste box, so show the progress screen
+// (including the target conversion) rather than an item opened from Recent.
+async function watch(id, started, g, fromShare) {
   clearTimeout(pollTimer);
   if (g !== gen) return;
-  const again = () => { pollTimer = setTimeout(() => watch(id, started, g), 2000); };
+  const again = () => { pollTimer = setTimeout(() => watch(id, started, g, fromShare), 2000); };
   let it;
   try {
     it = await api('/items/' + id);
@@ -109,9 +140,14 @@ async function watch(id, started, g) {
     return;
   }
   if (g !== gen) return;
-  if (it.status === 'waiting' || it.status === 'queued' || it.status === 'downloading') {
-    const label = { waiting: 'Waiting for the downloader…', queued: 'Queued' }[it.status];
-    renderNote((it.title || 'Downloading') + ' — ' + (label || Math.round(it.percent || 0) + '%'));
+  if (it.status === 'waiting' || it.status === 'queued') {
+    renderProgress(it, 'Waiting for the downloader…', null);
+    again();
+    return;
+  }
+  if (it.status === 'downloading') {
+    const pct = Math.round(it.percent || 0);
+    renderProgress(it, 'Downloading ' + pct + '%', pct);
     again();
     return;
   }
@@ -120,7 +156,17 @@ async function watch(id, started, g) {
   // dead "File missing" card. (timestamp is nanoseconds since the epoch.)
   const recent = it.timestamp && Date.now() - it.timestamp / 1e6 < 30 * 60e3;
   if (it.status === 'finished' && !it.exists && recent && Date.now() - started < 60000) {
-    renderNote((it.title || 'Download') + ' — finishing…');
+    if (fromShare) renderProgress(it, 'Finishing…', 100);
+    else renderNote((it.title || 'Download') + ' — finishing…');
+    again();
+    return;
+  }
+  // After a share with a target, stay on the progress screen while the server
+  // fits the file for that app ("convert" = not picked up yet, briefly).
+  const tp = fromShare && it.status === 'finished' && (it.presets || []).find(p => p.name === it.target);
+  if (tp && (tp.state === 'queued' || tp.state === 'converting' || (tp.state === 'convert' && Date.now() - started < 120000))) {
+    const pct = tp.state === 'converting' ? Math.round(tp.percent || 0) : null;
+    renderProgress(it, 'Fitting for ' + tp.label + (pct != null ? ' ' + pct + '%' : '…'), pct);
     again();
     return;
   }

@@ -21,6 +21,42 @@ def detail(id, title):
     ])
     return d
 
+
+PROG = "9999999999999999"     # share -> progress screen -> ready card
+DONE = "dddddddddddddddd"     # share of something already downloaded
+
+def progress_api(notify_set, seq):
+    """A self-contained mock for the share progress screen; seq is the list of
+    item states returned by successive GET /api/items/PROG polls."""
+    n = {"i": 0}
+    def handler(route):
+        req = route.request
+        path = urlparse(req.url).path
+        if path == "/api/me":
+            return route.fulfill(json={"name": "Ada", "dir": "ada", "admin": False, "auth": "oidc",
+                "defaultTarget": "signal", "targets": TARGETS,
+                "notify": {"set": notify_set, "count": 1 if notify_set else 0, "instanceWide": False}})
+        if path == "/api/downloads":
+            body = json.loads(req.post_data)
+            if "already" in body["url"]:
+                return route.fulfill(json={"id": DONE, "existing": True})
+            return route.fulfill(status=201, json={"id": PROG})
+        if path == f"/api/items/{DONE}":
+            return route.fulfill(json=detail(DONE, "Old one"))
+        if path == f"/api/items/{PROG}":
+            st = seq[min(n["i"], len(seq) - 1)]
+            n["i"] += 1
+            return route.fulfill(json=st)
+        return route.fulfill(status=404, json={"error": "not found"})
+    return handler
+
+def prog_item(status, percent=0, title="", presets=None):
+    d = item(PROG, title, status=status, percent=percent)
+    d.update(url="https://youtu.be/abc", target="signal")
+    if presets is not None:
+        d.update(duration=30, presets=presets)
+    return d
+
 polls = {"n": 0}
 NOSLOT = "ffffffffffffffff"   # failed on an unknown host: no cookie slot
 ERR = "eeeeeeeeeeeeeeee"      # failed download that wants cookies
@@ -179,6 +215,43 @@ with sync_playwright() as p:
     src = fp.get_by_role("link", name="Source code")
     assert src.get_attribute("href") == "https://github.com/beefstew809/grab", src.get_attribute("href")
     fc.close()
+
+    # test_share_shows_progress_screen: a share says what is happening at once,
+    # then walks the stages until the finished card replaces it.
+    seq = [prog_item("waiting"), prog_item("downloading", 42, "Clip"),
+           prog_item("finished", 100, "Clip", [{"name": "signal", "label": "Signal", "state": "converting", "percent": 30, "estBytes": 1}]),
+           prog_item("finished", 100, "Clip", [{"name": "signal", "label": "Signal", "state": "ready", "estBytes": 1000}])]
+    pc = b.new_context(viewport={"width": 412, "height": 800})
+    pc.route("**/api/**", progress_api(False, seq))
+    pp = pc.new_page()
+    pp.goto(BASE + "/?text=look%20https://youtu.be/abc")
+    pp.wait_for_selector("text=Got it — downloading")
+    assert "youtu.be/abc" in pp.inner_text("#main"), pp.inner_text("#main")
+    assert "Recent list" in pp.inner_text("#main")  # no notifications set up
+    pp.wait_for_selector("text=Downloading 42%")
+    assert "Then: fit for Signal" in pp.inner_text("#main")
+    pp.wait_for_selector("text=Fitting for Signal 30%")
+    pp.wait_for_selector(".preset")  # ready: the normal item card takes over
+    assert "Got it" not in pp.inner_text("#main")
+    pc.close()
+
+    # test_progress_hint_with_notifications: with notifications on, it says you can close it.
+    nc = b.new_context(viewport={"width": 412, "height": 800})
+    nc.route("**/api/**", progress_api(True, [prog_item("waiting")]))
+    np_ = nc.new_page()
+    np_.goto(BASE + "/?url=https%3A%2F%2Fyoutu.be%2Fabc")
+    np_.wait_for_selector("text=Got it — downloading")
+    assert "notification" in np_.inner_text("#main"), np_.inner_text("#main")
+    nc.close()
+
+    # test_share_existing_says_already_downloaded
+    ec = b.new_context(viewport={"width": 412, "height": 800})
+    ec.route("**/api/**", progress_api(False, []))
+    ep = ec.new_page()
+    ep.goto(BASE + "/?url=https%3A%2F%2Fyoutu.be%2Falready")
+    ep.wait_for_selector("text=Already downloaded")
+    ep.wait_for_selector(".preset")
+    ec.close()
 
     # test_logged_out_share_redirects_and_returns: the shared link survives the login round trip.
     lo = b.new_context(viewport={"width": 412, "height": 800})
