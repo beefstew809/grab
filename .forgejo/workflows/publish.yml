@@ -143,10 +143,12 @@ jobs:
           case $version in *-*) ;; *) set -- "$@" -t "${IMAGE}:latest" ;; esac
           docker buildx imagetools create "$@" "${IMAGE}@${DIGEST}"
 
-  github:
-    needs: [checks, image]
-    # On main pushes `image` is skipped; skipped is not failure.
-    if: ${{ !failure() && !cancelled() }}
+  # Two jobs, not one with `if: !failure()`: Forgejo skips a job whose
+  # `needs` include a skipped job, so a single job that needed `image` never
+  # ran on main pushes (where `image` is skipped).
+  github-main:
+    if: github.ref == 'refs/heads/main'
+    needs: checks
     runs-on: docker
     steps:
       - name: Checkout
@@ -154,21 +156,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Push to GitHub
+      - name: Push main to GitHub
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
           set -eu
           set +x
-          if [ "$REF_TYPE" = tag ]; then
-            ref="refs/tags/${REF_NAME}"
-          else
-            ref="HEAD:refs/heads/main"
-          fi
           auth=$(printf 'beefstew809:%s' "$GH_TOKEN" | base64 | tr -d '\n')
           # Scoped to github.com so it never mixes with the checkout's own
           # credentials; no token in the URL, no force.
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
-            push "$GITHUB_REPO" "$ref"
+            push "$GITHUB_REPO" HEAD:refs/heads/main
+
+  github-tag:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [checks, image]
+    runs-on: docker
+    steps:
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Push the tag to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          set +x
+          auth=$(printf 'beefstew809:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push "$GITHUB_REPO" "refs/tags/${REF_NAME}"
