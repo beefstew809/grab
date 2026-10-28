@@ -22,6 +22,9 @@ COPY requirements.txt /tmp/requirements.txt
 RUN apk --no-cache upgrade && apk add --no-cache ffmpeg intel-media-driver python3 && \
     python3 -m venv /opt/apprise && \
     /opt/apprise/bin/pip install --no-cache-dir -r /tmp/requirements.txt && \
+    # pip is only the installer: drop it so the image doesn't ship pip's own
+    # vendored libraries (urllib3, msgpack, ...) for scanners to flag.
+    /opt/apprise/bin/python -m pip uninstall -y -q pip && \
     rm /tmp/requirements.txt && \
     mkdir /data /shares /cookies && chown 65532:65532 /data /shares /cookies
 COPY --from=build /grab /usr/local/bin/grab
