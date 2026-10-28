@@ -1,0 +1,174 @@
+name: publish
+
+# The only path to the public side. On main: re-prove the gates, then
+# fast-forward GitHub's main. On a v* tag: re-prove the gates, build the image
+# and push it by digest only, scan it, apply the version tags on ghcr.io only
+# if the scan passed, then push the tag to GitHub.
+#
+# Workflows can't depend on other workflows, so `checks` repeats the guard and
+# the tests instead of trusting the separate guard/test runs. Nothing is ever
+# force-pushed: if GitHub's main has moved on its own, the push is refused and
+# this run fails.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  IMAGE: ghcr.io/beefstew809/grab
+  GITHUB_REPO: https://github.com/beefstew809/grab.git
+
+jobs:
+  checks:
+    runs-on: docker
+    env:
+      GRAB_DENYLIST: ${{ secrets.GRAB_DENYLIST }}
+      SHARE_TEST_ENCODER: libx264
+      SHARE_REQUIRE_FFMPEG: "1"
+    steps:
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Require the deny-list
+        run: |
+          if [ -z "$GRAB_DENYLIST" ]; then
+            echo "GRAB_DENYLIST is not set; refusing to publish" >&2
+            exit 1
+          fi
+
+      - name: Install ffmpeg
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ffmpeg
+          ffmpeg -hide_banner -encoders | grep libx264 > /dev/null
+
+      - name: Set up Go
+        uses: https://data.forgejo.org/actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: go vet and go test
+        run: go vet ./... && go test ./...
+
+      - name: File tree guard
+        run: |
+          go test -count=1 -run '^TestNoPersonalStrings$' -v . > tree.log 2>&1 || { cat tree.log; exit 1; }
+          cat tree.log
+          if grep -e '--- SKIP' tree.log > /dev/null; then
+            echo "tree check skipped" >&2
+            exit 1
+          fi
+
+      - name: Commit and tag metadata guard
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then
+            sh scripts/public-guard.sh --all "$REF_NAME"
+          else
+            sh scripts/public-guard.sh --all
+          fi
+
+  image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: checks
+    # `build`: the runner with a remote BuildKit daemon (generic service name).
+    runs-on: build
+    steps:
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Buildx
+        uses: https://data.forgejo.org/docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          driver: remote
+          endpoint: tcp://buildkitd:1234
+
+      - name: Log in to ghcr.io
+        uses: https://data.forgejo.org/docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: beefstew809
+          password: ${{ secrets.GH_TOKEN }}
+
+      # By digest only: an image that later fails the scan is never reachable
+      # through a version tag.
+      - name: Build and push by digest
+        id: build
+        uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          provenance: true
+          sbom: true
+
+      # Trivy CLI directly (checksum-verified), not trivy-action: that action
+      # resolves a nested action by a bare reference that Forgejo can't fetch.
+      - name: Scan the image
+        env:
+          TRIVY_VERSION: "0.76.1" # bump this line to update trivy
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          sums="trivy_${TRIVY_VERSION}_checksums.txt"
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          work=$(mktemp -d)
+          curl -sSL -o "$work/$tarball" "$base/$tarball"
+          curl -sSL -o "$work/$sums" "$base/$sums"
+          ( cd "$work" && grep " ${tarball}\$" "$sums" | sha256sum -c - )
+          tar -xzf "$work/$tarball" -C "$work" trivy
+          install -m 0755 "$work/trivy" /usr/local/bin/trivy
+          rm -rf "$work"
+          trivy image --image-src remote --exit-code 1 --ignore-unfixed \
+            --severity CRITICAL,HIGH "${IMAGE}@${DIGEST}"
+
+      - name: Apply version tags
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          version=${REF_NAME#v}
+          minor=$(echo "$version" | cut -d. -f1,2)
+          set -- -t "${IMAGE}:${version}" -t "${IMAGE}:${minor}"
+          # Pre-releases (v2.1.0-rc1) never move latest.
+          case $version in *-*) ;; *) set -- "$@" -t "${IMAGE}:latest" ;; esac
+          docker buildx imagetools create "$@" "${IMAGE}@${DIGEST}"
+
+  github:
+    needs: [checks, image]
+    # On main pushes `image` is skipped; skipped is not failure.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: docker
+    steps:
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Push to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          set +x
+          if [ "$REF_TYPE" = tag ]; then
+            ref="refs/tags/${REF_NAME}"
+          else
+            ref="HEAD:refs/heads/main"
+          fi
+          auth=$(printf 'beefstew809:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          # Scoped to github.com so it never mixes with the checkout's own
+          # credentials; no token in the URL, no force.
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push "$GITHUB_REPO" "$ref"

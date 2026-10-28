@@ -316,3 +316,19 @@ API): `e2e/run.sh`.
 
 `TestNoPersonalStrings` fails if any file contains a string from the
 comma-separated `GRAB_DENYLIST` environment variable; it skips when unset.
+
+## Releasing (maintainers)
+
+The upstream repository is the source of truth; GitHub's `main` and tags are
+published from it by CI, never pushed by hand.
+
+1. Merge to `main` (fast-forward only).
+2. Tag with the repository-local identity: `git tag -a vX.Y.Z -m "vX.Y.Z"`, then
+   push the tag upstream.
+3. The tag's `publish` run re-checks the code and history, builds the image,
+   pushes it by digest, scans it with Trivy, and only then tags
+   `ghcr.io/beefstew809/grab:X.Y.Z`, `X.Y` and (for non-pre-releases) `latest`.
+   It then pushes the tag to GitHub.
+
+A tag whose scan fails never gets image tags; fix it and release the next patch
+version rather than moving the tag.
