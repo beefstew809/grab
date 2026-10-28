@@ -4,7 +4,12 @@
 # this covers what a tree scan can't see: author/committer identities, commit
 # messages, tag names, taggers and tag messages.
 #
-# Usage: GRAB_DENYLIST='a,b,c' scripts/public-guard.sh <rev-range|--all> [tag ...]
+# Usage: GRAB_DENYLIST='a,b,c' [GRAB_ALLOWED_EMAILS='x@y,z@w'] \
+#          scripts/public-guard.sh <rev-range|--all> [tag ...]
+# Every commit's full tree and file names are scanned too, not just the tip:
+# a string added and removed again within a push would still be published.
+# With GRAB_ALLOWED_EMAILS set, any author/committer/tagger email outside it
+# is a finding (a deny-list can't anticipate every personal address).
 # Exit: 0 clean, 1 finding(s), 2 usage error / empty deny-list / bad range.
 # Findings name the commit or tag and the field, never the matched value: CI
 # logs are public enough that echoing the value would leak it.
@@ -24,6 +29,9 @@ if [ ! -s "$tmp/deny" ]; then
 	exit 2
 fi
 
+# Optional allow-list of identity emails, one per line.
+printf '%s' "${GRAB_ALLOWED_EMAILS:-}" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' > "$tmp/allow" || true
+
 found=0
 # check <label> <field> <value>: no pipes into grep -q (pipefail-safe); the
 # value goes through a file.
@@ -31,6 +39,17 @@ check() {
 	printf '%s\n' "$3" > "$tmp/value"
 	if grep -F -i -q -f "$tmp/deny" "$tmp/value"; then
 		echo "public-guard: $1: $2"
+		found=1
+	fi
+}
+
+# allowed <label> <field> <email>: a finding when an allow-list is set and the
+# email (angle brackets stripped) isn't on it exactly.
+allowed() {
+	[ -s "$tmp/allow" ] || return 0
+	printf '%s\n' "$3" | tr -d '<>' > "$tmp/value"
+	if ! grep -F -x -i -q -f "$tmp/allow" "$tmp/value"; then
+		echo "public-guard: $1: $2 not allowed"
 		found=1
 	fi
 }
@@ -48,6 +67,17 @@ for c in $revs; do
 	check "commit $short" "committer name" "$(git show -s --format=%cn "$c")"
 	check "commit $short" "committer email" "$(git show -s --format=%ce "$c")"
 	check "commit $short" "message" "$(git show -s --format=%B "$c")"
+	allowed "commit $short" "author email" "$(git show -s --format=%ae "$c")"
+	allowed "commit $short" "committer email" "$(git show -s --format=%ce "$c")"
+	if git grep -a -i -F -q -f "$tmp/deny" "$c" -- 2>/dev/null; then
+		echo "public-guard: commit $short: tree"
+		found=1
+	fi
+	git ls-tree -r --name-only "$c" > "$tmp/paths"
+	if grep -F -i -q -f "$tmp/deny" "$tmp/paths"; then
+		echo "public-guard: commit $short: file names"
+		found=1
+	fi
 done
 
 for t in "$@"; do
@@ -60,6 +90,7 @@ for t in "$@"; do
 	check "$label" "tagger name" "$(git for-each-ref --format='%(taggername)' "refs/tags/$t")"
 	check "$label" "tagger email" "$(git for-each-ref --format='%(taggeremail)' "refs/tags/$t")"
 	check "$label" "message" "$(git for-each-ref --format='%(contents)' "refs/tags/$t")"
+	allowed "$label" "tagger email" "$(git for-each-ref --format='%(taggeremail)' "refs/tags/$t")"
 done
 
 exit $found

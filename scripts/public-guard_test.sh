@@ -17,7 +17,8 @@ newrepo() {
 
 commit() { # repo message [env assignments...]
 	r=$1; m=$2; shift 2
-	echo "$m" >> "$r/f"
+	# Neutral content: cases put denied strings in metadata unless they mean the tree.
+	echo x >> "$r/f"
 	git -C "$r" add f
 	env "$@" git -C "$r" commit -q -m "$m"
 }
@@ -61,6 +62,23 @@ expect case_range_all_dirty 1 "message" "" env GRAB_DENYLIST=blocked sh -c "cd $
 
 r=$(newrepo); commit "$r" clean
 expect case_bad_range 2 "" "" env GRAB_DENYLIST=blocked sh -c "cd $r && sh $GUARD nosuch..HEAD"
+
+# A denied string added and removed again within the pushed commits.
+r=$(newrepo); echo "see blocked.example" > "$r/leak.txt"; git -C "$r" add leak.txt; git -C "$r" commit -q -m add
+git -C "$r" rm -q leak.txt; git -C "$r" commit -q -m remove
+expect case_tree_intermediate 1 "tree" "blocked.example" env GRAB_DENYLIST=blocked.example sh -c "cd $r && sh $GUARD --all"
+
+r=$(newrepo); echo fine > "$r/blocked-notes.txt"; git -C "$r" add blocked-notes.txt; git -C "$r" commit -q -m add
+expect case_path_name 1 "file names" "blocked-notes" env GRAB_DENYLIST=blocked sh -c "cd $r && sh $GUARD --all"
+
+r=$(newrepo); commit "$r" one GIT_AUTHOR_EMAIL=someone@elsewhere.example
+expect case_email_not_allowed 1 "author email not allowed" "elsewhere" env GRAB_DENYLIST=unused GRAB_ALLOWED_EMAILS=test@example.com sh -c "cd $r && sh $GUARD --all"
+
+r=$(newrepo); commit "$r" one; git -C "$r" tag -a v1.0.0 -m ok
+expect case_email_allowed 0 "" "" env GRAB_DENYLIST=unused GRAB_ALLOWED_EMAILS='test@example.com, bot@renovateapp.com' sh -c "cd $r && sh $GUARD --all v1.0.0"
+
+r=$(newrepo); commit "$r" one; GIT_COMMITTER_EMAIL=tagger@elsewhere.example git -C "$r" tag -a v1.0.0 -m ok
+expect case_tagger_not_allowed 1 "tagger email not allowed" "elsewhere" env GRAB_DENYLIST=unused GRAB_ALLOWED_EMAILS=test@example.com sh -c "cd $r && sh $GUARD --all v1.0.0"
 
 [ $fails = 0 ] || { echo "$fails case(s) failed"; exit 1; }
 echo "all cases passed"

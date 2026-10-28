@@ -16,6 +16,7 @@ jobs:
     runs-on: docker
     env:
       GRAB_DENYLIST: ${{ secrets.GRAB_DENYLIST }}
+      GRAB_ALLOWED_EMAILS: "30852148+beefstew809@users.noreply.github.com,bot@renovateapp.com"
     steps:
       - name: Checkout
         uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

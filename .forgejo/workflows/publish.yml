@@ -23,6 +23,7 @@ jobs:
     runs-on: docker
     env:
       GRAB_DENYLIST: ${{ secrets.GRAB_DENYLIST }}
+      GRAB_ALLOWED_EMAILS: "30852148+beefstew809@users.noreply.github.com,bot@renovateapp.com"
       SHARE_TEST_ENCODER: libx264
       SHARE_REQUIRE_FFMPEG: "1"
     steps:
@@ -73,11 +74,31 @@ jobs:
             sh scripts/public-guard.sh --all
           fi
 
+      # The separate secret-scan workflow only gates merges; direct pushes to
+      # main would still publish. Scan the whole history here, before GitHub.
+      - name: Secret scan (gitleaks)
+        env:
+          GITLEAKS_VERSION: "8.30.1" # bump this line to update gitleaks
+        run: |
+          set -eu
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          sums="gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          work=$(mktemp -d)
+          curl -sSL -o "$work/$tarball" "$base/$tarball"
+          curl -sSL -o "$work/$sums" "$base/$sums"
+          ( cd "$work" && grep " ${tarball}\$" "$sums" | sha256sum -c - )
+          tar -xzf "$work/$tarball" -C "$work" gitleaks
+          "$work/gitleaks" git --log-opts="--all" --redact --no-banner .
+          rm -rf "$work"
+
   image:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: checks
     # `build`: the runner with a remote BuildKit daemon (generic service name).
     runs-on: build
+    env:
+      GRAB_DENYLIST: ${{ secrets.GRAB_DENYLIST }}
     steps:
       - name: Checkout
         uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -95,8 +116,21 @@ jobs:
           username: beefstew809
           password: ${{ secrets.GH_TOKEN }}
 
+      # Published versions never move: a re-run or a moved git tag must not
+      # silently re-point X.Y.Z at a new build.
+      - name: Refuse an existing version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE}:${REF_NAME#v}" > /dev/null 2>&1; then
+            echo "${IMAGE}:${REF_NAME#v} already exists; release a new version instead" >&2
+            exit 1
+          fi
+
       # By digest only: an image that later fails the scan is never reachable
-      # through a version tag.
+      # through a version tag. BUILDX_GIT_INFO=false and a public builder-id
+      # keep the CI server's internal address out of the provenance
+      # attestation, which is published with the image.
       - name: Build and push by digest
         id: build
         uses: https://data.forgejo.org/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -106,8 +140,10 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             VERSION=${{ github.ref_name }}
-          provenance: true
+          provenance: mode=min,builder-id=https://github.com/beefstew809/grab
           sbom: true
+        env:
+          BUILDX_GIT_INFO: "false"
 
       # Trivy CLI directly (checksum-verified), not trivy-action: that action
       # resolves a nested action by a bare reference that Forgejo can't fetch.
@@ -129,6 +165,24 @@ jobs:
           rm -rf "$work"
           trivy image --image-src remote --exit-code 1 --ignore-unfixed \
             --severity CRITICAL,HIGH "${IMAGE}@${DIGEST}"
+
+      # Backstop for the attestations: they ship with the image, so they get
+      # the same deny-list as the source.
+      - name: Check attestations for personal strings
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          if [ -z "$GRAB_DENYLIST" ]; then echo "GRAB_DENYLIST is not set" >&2; exit 1; fi
+          work=$(mktemp -d)
+          printf '%s' "$GRAB_DENYLIST" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' > "$work/deny"
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Provenance}}' > "$work/att"
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .SBOM}}' >> "$work/att"
+          if grep -F -i -q -f "$work/deny" "$work/att"; then
+            echo "attestations contain a denied string; not tagging" >&2
+            exit 1
+          fi
+          rm -rf "$work"
 
       - name: Apply version tags
         env:
