@@ -84,9 +84,12 @@ for t in "$@"; do
 	git rev-parse -q --verify "refs/tags/$t" >/dev/null || { echo "public-guard: no such tag" >&2; exit 2; }
 	# A denied tag name would leak through its own label: name it by object id.
 	label="tag $t"
-	before=$found
-	check "tag $(git rev-parse --short "refs/tags/$t")" "name" "$t"
-	[ "$found" = "$before" ] || label="tag $(git rev-parse --short "refs/tags/$t")"
+	printf '%s\n' "$t" > "$tmp/value"
+	if grep -F -i -q -f "$tmp/deny" "$tmp/value"; then
+		label="tag $(git rev-parse --short "refs/tags/$t")"
+		echo "public-guard: $label: name"
+		found=1
+	fi
 	check "$label" "tagger name" "$(git for-each-ref --format='%(taggername)' "refs/tags/$t")"
 	check "$label" "tagger email" "$(git for-each-ref --format='%(taggeremail)' "refs/tags/$t")"
 	check "$label" "message" "$(git for-each-ref --format='%(contents)' "refs/tags/$t")"

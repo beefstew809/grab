@@ -2,6 +2,8 @@
 # Tests for public-guard.sh against throwaway repositories.
 # Usage: sh scripts/public-guard_test.sh   (exits non-zero on any failure)
 set -u
+# The workflows set an allow-list job-wide; cases opt in to one explicitly.
+unset GRAB_ALLOWED_EMAILS
 GUARD=$(cd "$(dirname "$0")" && pwd)/public-guard.sh
 fails=0
 
@@ -79,6 +81,12 @@ expect case_email_allowed 0 "" "" env GRAB_DENYLIST=unused GRAB_ALLOWED_EMAILS='
 
 r=$(newrepo); commit "$r" one; GIT_COMMITTER_EMAIL=tagger@elsewhere.example git -C "$r" tag -a v1.0.0 -m ok
 expect case_tagger_not_allowed 1 "tagger email not allowed" "elsewhere" env GRAB_DENYLIST=unused GRAB_ALLOWED_EMAILS=test@example.com sh -c "cd $r && sh $GUARD --all v1.0.0"
+
+# A denied tag name stays hidden even when an earlier finding already set the
+# exit status (the label switch must not depend on the running total).
+r=$(newrepo); commit "$r" one GIT_AUTHOR_EMAIL=other@elsewhere.example
+GIT_COMMITTER_EMAIL=other@elsewhere.example git -C "$r" tag -a blocked-1 -m fine
+expect case_tag_name_hidden_after_other_findings 1 ": name" "blocked-1" env GRAB_DENYLIST=blocked GRAB_ALLOWED_EMAILS=test@example.com sh -c "cd $r && sh $GUARD --all blocked-1"
 
 [ $fails = 0 ] || { echo "$fails case(s) failed"; exit 1; }
 echo "all cases passed"
