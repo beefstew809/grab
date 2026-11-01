@@ -320,15 +320,26 @@ comma-separated `GRAB_DENYLIST` environment variable; it skips when unset.
 ## Releasing (maintainers)
 
 The upstream repository is the source of truth; GitHub's `main` and tags are
-published from it by CI, never pushed by hand.
+published from it by CI, never pushed by hand. Merging to `main` releases it,
+so unfinished work stays on its branch until it is ready to ship.
 
 1. Merge to `main` (fast-forward only).
-2. Tag with the repository-local identity: `git tag -a vX.Y.Z -m "vX.Y.Z"`, then
-   push the tag upstream.
-3. The tag's `publish` run re-checks the code and history, builds the image,
-   pushes it by digest, scans it with Trivy, and only then tags
-   `ghcr.io/beefstew809/grab:X.Y.Z`, `X.Y` and (for non-pre-releases) `latest`.
-   It then pushes the tag to GitHub.
+2. The `publish` run re-checks the code and history and mirrors `main` to
+   GitHub, then picks the next version from the commit subjects since the last
+   `vX.Y.Z` tag: a patch release by default, minor if any subject is `feat:`,
+   major for a `!` after the type (`feat!:`) or a `BREAKING CHANGE:` footer.
+3. It tags `vX.Y.Z` with the repository-local identity, runs the metadata
+   guard on that tag, builds the image, pushes it by digest, scans it (Trivy)
+   and checks its attestations, and only then pushes the tag upstream and tags
+   `ghcr.io/beefstew809/grab:X.Y.Z`, `X.Y` and `latest`. The tag goes to GitHub
+   last.
 
-A tag whose scan fails never gets image tags; fix it and release the next patch
-version rather than moving the tag.
+"Release now" (for example a rebuild for a base-image fix with no new commit)
+is a manual run of the `publish` workflow with `bump` set to `patch`, `minor`
+or `major`. When several merges land at once, only the run for the newest
+`main` releases.
+
+A run whose checks fail publishes no image tags and no GitHub tag; fix the
+cause and merge again. Published versions never move.
+Deployments that pin `ghcr.io/beefstew809/grab:X.Y.Z` with its digest pick up
+new releases through Renovate.

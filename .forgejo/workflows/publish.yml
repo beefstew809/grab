@@ -1,18 +1,36 @@
 name: publish
 
-# The only path to the public side. On main: re-prove the gates, then
-# fast-forward GitHub's main. On a v* tag: re-prove the gates, build the image
-# and push it by digest only, scan it, apply the version tags on ghcr.io only
-# if the scan passed, then push the tag to GitHub.
+# The only path to the public side. Every push to main releases it: re-prove
+# the gates, fast-forward GitHub's main, then compute the next version from the
+# commit subjects, tag it locally and guard the tag, build the image and push
+# it by digest only, scan it, push the git tag upstream, apply the version tags
+# on ghcr.io, and only then push the tag to GitHub. "Release now" is this
+# workflow's dispatch (bump: patch / minor / major forces a release).
 #
 # Workflows can't depend on other workflows, so `checks` repeats the guard and
 # the tests instead of trusting the separate guard/test runs. Nothing is ever
 # force-pushed: if GitHub's main has moved on its own, the push is refused and
 # this run fails.
+#
+# The version/superseded/scan scripts are the shared release/ scripts from
+# homelab/ci-workflows (the same ones its app-release.yml runs). They are
+# checked out in the `version` job, and in `image` only after the build, so
+# they are never in the build context. No concurrency: group (queued Forgejo
+# runs stall); overlapping runs are handled by the superseded checks and by the
+# git tag push, which refuses a tag that already exists.
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Release level (auto reads the commit subjects).
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+      ci_ref:
+        description: ci-workflows ref to load release/ from. Leave at main.
+        default: main
 
 env:
   IMAGE: ghcr.io/beefstew809/grab
@@ -94,16 +112,117 @@ jobs:
           "$work/gitleaks" git --log-opts="HEAD" --redact --no-banner .
           rm -rf "$work"
 
-  image:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: checks
-    # `build`: the runner with a remote BuildKit daemon (generic service name).
-    runs-on: build
-    env:
-      GRAB_DENYLIST: ${{ secrets.GRAB_DENYLIST }}
+  # Dependency, filesystem and secret scans (the same reusable workflow the
+  # separate security workflow runs on pull requests).
+  security:
+    uses: homelab/ci-workflows/.forgejo/workflows/app-security.yml@main
+    with:
+      go_dirs: .
+
+  version:
+    needs: [checks, security]
+    runs-on: docker
+    outputs:
+      release: ${{ steps.next.outputs.release }}
+      version: ${{ steps.next.outputs.version }}
     steps:
+      # A dispatch can name any branch; releasing one would publish unmerged
+      # code and take a version number main then collides with.
+      - name: Require main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != refs/heads/main ]; then
+            echo "::error ::releases run only from main (got $REF)"
+            exit 1
+          fi
+          echo "releasing from $REF"
+
+      # Full history and tags: next-version.py walks back to the last vX.Y.Z.
       - name: Checkout
         uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Check out ci-workflows
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: homelab/ci-workflows
+          ref: ${{ inputs.ci_ref || 'main' }}
+          path: .ci-workflows
+
+      # Renovate often merges several PRs within a minute: only the run for
+      # main's current head releases; older runs end green here.
+      - name: Superseded check
+        id: superseded
+        env:
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          verdict=$(.ci-workflows/release/superseded.sh)
+          echo "$verdict"
+          echo "$verdict" >> "$GITHUB_OUTPUT"
+
+      # Writes the job's outputs, so it must not fail after writing them: a
+      # failed step drops its $GITHUB_OUTPUT. A missing vX.Y.Z tag fails here,
+      # before anything is written, and fails the job.
+      - name: Next version
+        id: next
+        env:
+          BUMP: ${{ inputs.bump || 'auto' }}
+          SHA: ${{ github.sha }}
+          SUPERSEDED: ${{ steps.superseded.outputs.superseded }}
+        run: |
+          json=$(python3 .ci-workflows/release/next-version.py --repo . --head "$SHA" --bump "$BUMP")
+          echo "$json"
+          release=$(jq -r '.release' <<< "$json")
+          version=$(jq -r '.version' <<< "$json")
+          if [ "$SUPERSEDED" = true ]; then
+            echo "main has moved on; the run for the newer head releases instead"
+            release=false
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: [checks, security, version]
+    if: needs.version.outputs.release == 'true'
+    # `build`: the runner with a remote BuildKit daemon (generic service name).
+    runs-on: build
+    outputs:
+      released: ${{ steps.promote.outputs.released }}
+    env:
+      GRAB_DENYLIST: ${{ secrets.GRAB_DENYLIST }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      # Full history: the tag guard below re-reads every commit the tag
+      # publishes.
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      # Local only until the image has passed every check. The tag is public
+      # metadata too (tagger, message), so it is made with the repository's
+      # public identity and guarded before anything is pushed.
+      - name: Create the tag locally
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          if ! [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error ::version '$VERSION' is not X.Y.Z" >&2
+            exit 1
+          fi
+          unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+          git -c user.name=beefstew809 -c user.email=30852148+beefstew809@users.noreply.github.com \
+            tag -a "v$VERSION" -m "v$VERSION" "$SHA"
+
+      - name: Guard the tag
+        env:
+          GRAB_ALLOWED_EMAILS: "30852148+beefstew809@users.noreply.github.com,bot@renovateapp.com"
+        run: sh scripts/public-guard.sh HEAD "v$VERSION"
 
       - name: Set up Buildx
         uses: https://data.forgejo.org/docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -119,15 +238,38 @@ jobs:
           password: ${{ secrets.GH_TOKEN }}
 
       # Published versions never move: a re-run or a moved git tag must not
-      # silently re-point X.Y.Z at a new build.
+      # silently re-point X.Y.Z at a new build. Only a registry "not found"
+      # counts as absent; any other inspect failure (5xx, timeout, auth) stops
+      # the run, since the version might exist. The tag must be free upstream
+      # and on GitHub too; the upstream tag push below also refuses a version
+      # someone else took.
       - name: Refuse an existing version
         env:
-          REF_NAME: ${{ github.ref_name }}
+          GIT_TERMINAL_PROMPT: "0"
         run: |
-          if docker buildx imagetools inspect "${IMAGE}:${REF_NAME#v}" > /dev/null 2>&1; then
-            echo "${IMAGE}:${REF_NAME#v} already exists; release a new version instead" >&2
+          if err=$(docker buildx imagetools inspect "$IMAGE:$VERSION" 2>&1 > /dev/null); then
+            echo "::error ::$IMAGE:$VERSION already exists; refusing to re-point it" >&2
             exit 1
           fi
+          lower=${err,,}
+          case $lower in
+            *"not found"* | *manifest_unknown*) ;;
+            *)
+              echo "::error ::could not tell whether $IMAGE:$VERSION exists; refusing to release blind: $err" >&2
+              exit 1
+              ;;
+          esac
+          for remote in origin "$GITHUB_REPO"; do
+            if ! tags=$(git ls-remote --tags "$remote" "v$VERSION"); then
+              echo "::error ::could not list the tags of $remote; refusing to release blind" >&2
+              exit 1
+            fi
+            if [ -n "$tags" ]; then
+              echo "::error ::git tag v$VERSION already exists on $remote: $tags" >&2
+              exit 1
+            fi
+          done
+          echo "$VERSION is free"
 
       # By digest only: an image that later fails the scan is never reachable
       # through a version tag. BUILDX_GIT_INFO=false and a public builder-id
@@ -141,7 +283,7 @@ jobs:
           file: ./Dockerfile
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=v${{ needs.version.outputs.version }}
           provenance: mode=min,builder-id=https://github.com/beefstew809/grab
           # GitHub links a ghcr package to its repo from the top-level index's
           # annotations, not the image config's labels.
@@ -153,26 +295,21 @@ jobs:
         env:
           BUILDX_GIT_INFO: "false"
 
-      # Trivy CLI directly (checksum-verified), not trivy-action: that action
-      # resolves a nested action by a bare reference that Forgejo can't fetch.
+      # After the build, so the ci-workflows checkout is never in the build
+      # context (and so never in the public image).
+      - name: Check out ci-workflows
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: homelab/ci-workflows
+          ref: ${{ inputs.ci_ref || 'main' }}
+          path: .ci-workflows
+
+      # Every scanner in release/image-scans.d (Trivy: fixable CRITICAL/HIGH
+      # fail); any failure, or no scanner run at all, fails the job.
       - name: Scan the image
         env:
-          TRIVY_VERSION: "0.76.1" # bump this line to update trivy
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -eu
-          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          sums="trivy_${TRIVY_VERSION}_checksums.txt"
-          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
-          work=$(mktemp -d)
-          curl -sSL -o "$work/$tarball" "$base/$tarball"
-          curl -sSL -o "$work/$sums" "$base/$sums"
-          ( cd "$work" && grep " ${tarball}\$" "$sums" | sha256sum -c - )
-          tar -xzf "$work/$tarball" -C "$work" trivy
-          install -m 0755 "$work/trivy" /usr/local/bin/trivy
-          rm -rf "$work"
-          trivy image --image-src remote --exit-code 1 --ignore-unfixed \
-            --severity CRITICAL,HIGH "${IMAGE}@${DIGEST}"
+          IMAGE_REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: .ci-workflows/release/scan-image.sh
 
       # Backstop for the attestations: they ship with the image, so they get
       # the same deny-list as the source.
@@ -192,18 +329,41 @@ jobs:
           fi
           rm -rf "$work"
 
+      # A newer merge landed while this run built: it will release, so stop
+      # here green. The remaining steps (and github-tag) are skipped on
+      # superseded=true.
+      - name: Superseded recheck
+        id: recheck
+        env:
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          verdict=$(.ci-workflows/release/superseded.sh)
+          echo "$verdict"
+          echo "$verdict" >> "$GITHUB_OUTPUT"
+
+      # The git tag goes first and acts as the lock: the upstream rejects a
+      # tag that already exists, so two runs can't both promote the same
+      # version. A failed promote below only leaves a gap in the numbers,
+      # whereas an image tag with no git tag would block every later release.
+      # Pushed with the checkout's job token, which starts no workflow.
+      - name: Push the tag upstream
+        if: steps.recheck.outputs.superseded == 'false'
+        run: git push origin "refs/tags/v$VERSION"
+
       - name: Apply version tags
+        id: promote
+        if: steps.recheck.outputs.superseded == 'false'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
           set -eu
-          version=${REF_NAME#v}
-          minor=$(echo "$version" | cut -d. -f1,2)
-          set -- -t "${IMAGE}:${version}" -t "${IMAGE}:${minor}"
-          # Pre-releases (v2.1.0-rc1) never move latest.
-          case $version in *-*) ;; *) set -- "$@" -t "${IMAGE}:latest" ;; esac
+          minor=$(echo "$VERSION" | cut -d. -f1,2)
+          set -- -t "${IMAGE}:${VERSION}" -t "${IMAGE}:${minor}"
+          # Pre-releases (2.1.0-rc1) never move latest.
+          case $VERSION in *-*) ;; *) set -- "$@" -t "${IMAGE}:latest" ;; esac
           docker buildx imagetools create "$@" "${IMAGE}@${DIGEST}"
+          echo "released=true" >> "$GITHUB_OUTPUT"
 
   # Two jobs, not one with `if: !failure()`: Forgejo skips a job whose
   # `needs` include a skipped job, so a single job that needed `image` never
@@ -230,23 +390,74 @@ jobs:
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
             push "$GITHUB_REPO" HEAD:refs/heads/main
 
+  # Only after `image` promoted: released is unset when nothing was released,
+  # the run was superseded, or any image step failed, and then this job is
+  # skipped.
   github-tag:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [checks, image]
+    needs: [version, image]
+    if: needs.image.outputs.released == 'true'
     runs-on: docker
+    env:
+      GRAB_DENYLIST: ${{ secrets.GRAB_DENYLIST }}
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - name: Checkout
         uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          fetch-tags: true
+
+      # The tag GitHub gets is the one `image` pushed upstream: it must still
+      # name this run's commit and still pass the guard.
+      - name: Verify the tag
+        env:
+          SHA: ${{ github.sha }}
+          GRAB_ALLOWED_EMAILS: "30852148+beefstew809@users.noreply.github.com,bot@renovateapp.com"
+        run: |
+          set -eu
+          git fetch -q origin "+refs/tags/v$VERSION:refs/tags/v$VERSION"
+          target=$(git rev-parse "refs/tags/v$VERSION^{commit}")
+          if [ "$target" != "$SHA" ]; then
+            echo "::error ::tag v$VERSION names $target, not $SHA; not publishing it" >&2
+            exit 1
+          fi
+          sh scripts/public-guard.sh HEAD "v$VERSION"
 
       - name: Push the tag to GitHub
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
           set -eu
           set +x
           auth=$(printf 'beefstew809:%s' "$GH_TOKEN" | base64 | tr -d '\n')
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
-            push "$GITHUB_REPO" "refs/tags/${REF_NAME}"
+            push "$GITHUB_REPO" "refs/tags/v${VERSION}"
+
+  notify-failure:
+    # Releases run with nobody watching, so a failure must reach a human.
+    # Nothing failed (including nothing to release) = skipped.
+    needs: [checks, security, version, image, github-main, github-tag]
+    if: failure()
+    runs-on: docker
+    steps:
+      - name: Alert via Apprise
+        env:
+          APPRISE_URL: ${{ secrets.APPRISE_URL }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$APPRISE_URL" ]; then
+            echo "::warning ::APPRISE_URL is not set; the failed publish of $REPO was not alerted."
+            exit 0
+          fi
+          body="Publish of $REPO at ${SHA:0:7} failed; check what reached GitHub and ghcr.io. $RUN_URL"
+          # jq -n --arg so a quote anywhere can't break the JSON. tag "all":
+          # apprise-api only dispatches tagged URLs when the request names a
+          # matching tag (otherwise it answers 424 and sends nothing).
+          payload=$(jq -n \
+            --arg title "Publish failed: $REPO" \
+            --arg body "$body" \
+            '{title: $title, body: $body, type: "failure", tag: "all"}')
+          curl -fsS --max-time 20 -X POST "$APPRISE_URL" -H 'Content-Type: application/json' -d "$payload" \
+            || echo "::warning ::Apprise alert failed for $REPO."

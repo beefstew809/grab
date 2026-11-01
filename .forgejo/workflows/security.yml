@@ -2,12 +2,11 @@ name: security
 
 # Dependency, filesystem and secret scans, shared with the other homelab apps
 # through a reusable workflow (its README documents the exception formats).
+# Pull requests and manual runs only: on main, publish.yml runs the same scan
+# as a gate before anything is released.
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
 
 jobs:
