@@ -346,10 +346,30 @@ jobs:
       # tag that already exists, so two runs can't both promote the same
       # version. A failed promote below only leaves a gap in the numbers,
       # whereas an image tag with no git tag would block every later release.
-      # Pushed with the checkout's job token, which starts no workflow.
+      # v* tags are protected upstream and the job token is not on their
+      # allow-list, so this push uses TAG_PUSH_TOKEN (an allow-listed user's
+      # repository read+write token). Forgejo takes the user from the token
+      # itself, so the basic-auth user name is a fixed placeholder. The header
+      # goes on the same config key the checkout's credentials use, reset
+      # first: git sends every extraheader it collects, and an empty value
+      # clears the list.
       - name: Push the tag upstream
         if: steps.recheck.outputs.superseded == 'false'
-        run: git push origin "refs/tags/v$VERSION"
+        env:
+          TAG_PUSH_TOKEN: ${{ secrets.TAG_PUSH_TOKEN }}
+        run: |
+          set -eu
+          set +x
+          if [ -z "$TAG_PUSH_TOKEN" ]; then
+            echo "::error ::TAG_PUSH_TOKEN is not set; grab's v* tags are protected" >&2
+            exit 1
+          fi
+          url=$(git remote get-url origin)
+          base=$(printf '%s' "$url" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#')
+          key="http.${base}/.extraheader"
+          auth=$(printf 'x-access-token:%s' "$TAG_PUSH_TOKEN" | base64 | tr -d '\n')
+          git -c "${key}=" -c "${key}=AUTHORIZATION: basic ${auth}" \
+            push origin "refs/tags/v$VERSION"
 
       - name: Apply version tags
         id: promote
