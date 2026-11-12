@@ -17,7 +17,7 @@ RUN go vet ./... && go test ./... && \
 # iHD driver, and notifications shell out to the Apprise CLI (a Python
 # package, pinned in requirements.txt and installed in its own venv).
 # `apk upgrade` keeps a Trivy gate on fixable CRITICAL/HIGH green.
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 COPY requirements.txt /tmp/requirements.txt
 RUN apk --no-cache upgrade && apk add --no-cache ffmpeg intel-media-driver python3 && \
     python3 -m venv /opt/apprise && \
